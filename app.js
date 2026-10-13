@@ -7,6 +7,7 @@ const ZXING_PONYFILL_URL =
   "https://cdn.jsdelivr.net/npm/barcode-detector@3.2.2/dist/es/ponyfill.min.js";
 const FORMATS = ["ean_13", "ean_8", "upc_a", "upc_e"];
 const SCAN_INTERVAL_MS = 150;
+const MAX_FRAME_WIDTH = 1280;
 const DUPLICATE_WINDOW_MS = 2500;
 const BLACK_FRAME_CHECK_MS = 2500;
 const MAX_CODES = 25; // sendData erlaubt höchstens 4096 Byte
@@ -42,6 +43,8 @@ const diag = {
   "Nativer BarcodeDetector": "BarcodeDetector" in window ? "vorhanden" : "fehlt",
   Erkennung: "wird geladen …",
   Kamerabild: "–",
+  "Analysierte Bilder": "0",
+  "Letzter Erkennungsfehler": "–",
   "User-Agent": navigator.userAgent,
 };
 const logLines = [];
@@ -81,8 +84,12 @@ function setStatus(text, cls = "hint") {
 
 // ---------- Erkennung ----------
 
+// Standard ist ZXing: Die eingebaute Erkennung des Browsers liefert in der
+// Telegram-Ansicht teils stumm leere Ergebnisse. Zum Vergleich: ?engine=native
+const preferNative = new URLSearchParams(location.search).get("engine") === "native";
+
 async function loadDetector() {
-  if ("BarcodeDetector" in window) {
+  if (preferNative && "BarcodeDetector" in window) {
     try {
       const supported = await window.BarcodeDetector.getSupportedFormats();
       if (supported.includes("ean_13")) {
@@ -260,14 +267,36 @@ function checkForBlackFrame() {
   renderDiag();
 }
 
+// Einzelbild aus dem Video in ein Canvas kopieren – robuster in WebViews,
+// als das Video-Element direkt an die Erkennung zu geben.
+const frameCanvas = document.createElement("canvas");
+const frameCtx = frameCanvas.getContext("2d", { willReadFrequently: true });
+let framesAnalysed = 0;
+let lastDetectError = null;
+
+function grabFrame() {
+  const scale = Math.min(1, MAX_FRAME_WIDTH / video.videoWidth);
+  frameCanvas.width = Math.round(video.videoWidth * scale);
+  frameCanvas.height = Math.round(video.videoHeight * scale);
+  frameCtx.drawImage(video, 0, 0, frameCanvas.width, frameCanvas.height);
+  return frameCtx.getImageData(0, 0, frameCanvas.width, frameCanvas.height);
+}
+
 async function scanLoop() {
   if (!scanning) return;
   if (video.readyState >= 2 && video.videoWidth) {
     try {
-      const codes = await detector.detect(video);
+      const codes = await detector.detect(grabFrame());
+      framesAnalysed++;
       for (const c of codes) handleCode(c.rawValue, c.format, "Live-Scan", Date.now() - scanStartedAt);
     } catch (err) {
-      log(`Fehler bei der Erkennung: ${err.message}`);
+      if (err.message !== lastDetectError) log(`Fehler bei der Erkennung: ${err.name} – ${err.message}`);
+      lastDetectError = err.message;
+      diag["Letzter Erkennungsfehler"] = err.message;
+    }
+    if (framesAnalysed % 20 === 0) {
+      diag["Analysierte Bilder"] = `${framesAnalysed} (${frameCanvas.width}×${frameCanvas.height})`;
+      renderDiag();
     }
   }
   setTimeout(scanLoop, SCAN_INTERVAL_MS);
