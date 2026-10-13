@@ -67,6 +67,12 @@
     ul.results { list-style: none; padding: 0; margin: 0; }
     ul.results li { padding: 8px 0; border-top: 1px solid rgba(127,127,127,.2); }
     ul.results li:first-child { border-top: 0; }
+    ul.results li.result { display: flex; align-items: center; gap: 8px; }
+    ul.results li.result > div { flex: 1 1 auto; min-width: 0; }
+    button.remove {
+      flex: 0 0 auto; padding: 6px 10px; font-weight: 400;
+      background: transparent; color: var(--hint); border: 1px solid rgba(127,127,127,.35);
+    }
     .code { font: 600 18px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .5px; }
     .meta { color: var(--hint); font-size: 12px; }
     .ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); }
@@ -105,6 +111,7 @@
   <section>
     <h2>Erkannte Codes</h2>
     <ul class="results" id="results"><li class="hint">Noch nichts erkannt.</li></ul>
+    <p class="hint" id="send-hint" style="margin-top:8px"></p>
   </section>
 
   <section>

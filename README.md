@@ -12,6 +12,7 @@ Das ist **kein** Teil der späteren Umsetzung, sondern ein Wegwerf-Prototyp für
 | 2 · Foto aufnehmen | Die normale Handykamera öffnet sich, der Code wird aus dem Foto gelesen | Die robustere Rückfallebene |
 
 Außerdem:
+- **An Chat senden:** Die erkannten Codes werden gesammelt, falsche lassen sich mit ✕ entfernen. Über den Telegram-Hauptknopf „An Chat senden“ gehen sie per `Telegram.WebApp.sendData` an den Bot, danach schließt sich die App. Das funktioniert nur, wenn die App über den Tastatur-Knopf „📷 Scannen“ des Bots geöffnet wurde. Den Bot dazu gibt es unter `prototypen/telegram-bot/` im Projektordner. Der Bot liegt bewusst nicht in diesem öffentlichen Repository, weil er mit einem geheimen Token arbeitet.
 - **Prüfziffernkontrolle** für EAN-13, EAN-8 und UPC-A. Das ist ein Vorgeschmack auf die Stufe „Prüfen“ aus Anf. §4.
 - **Diagnose:** Umgebung, Telegram-Plattform und -Version, verwendete Erkennung (eingebaut im Browser oder ZXing/WebAssembly), Kameraauflösung und eine Warnung, wenn das Kamerabild schwarz bleibt.
 - **Testprotokoll kopieren:** fasst Diagnose, Ergebnisse und Log als Text zusammen, zum Einfügen in die Tabelle unten.

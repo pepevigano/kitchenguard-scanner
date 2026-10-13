@@ -1,5 +1,7 @@
 // EAN-Scanner – Machbarkeitstest für eine Telegram Mini App (KitchenGuard).
-// Prüft zwei Erfassungswege: Live-Scan per Kamera und Foto aus der Systemkamera.
+// Erfasst Barcodes per Live-Scan oder Foto und schickt sie gesammelt an den Bot
+// (Telegram.WebApp.sendData – nur möglich, wenn die App über den Tastatur-Knopf
+// des Bots geöffnet wurde).
 
 const ZXING_PONYFILL_URL =
   "https://cdn.jsdelivr.net/npm/barcode-detector@3.2.2/dist/es/ponyfill.min.js";
@@ -7,9 +9,13 @@ const FORMATS = ["ean_13", "ean_8", "upc_a", "upc_e"];
 const SCAN_INTERVAL_MS = 150;
 const DUPLICATE_WINDOW_MS = 2500;
 const BLACK_FRAME_CHECK_MS = 2500;
+const MAX_CODES = 25; // sendData erlaubt höchstens 4096 Byte
+const PAYLOAD_VERSION = 1;
 
 const tg = window.Telegram?.WebApp;
-const inTelegram = Boolean(tg && tg.initData);
+const inTelegram = Boolean(tg && tg.platform && tg.platform !== "unknown");
+// Über den Menü-Knopf geöffnete Mini Apps bekommen eine query_id; dort ist sendData nicht möglich.
+const canSendToChat = inTelegram && !tg.initDataUnsafe?.query_id;
 if (tg) {
   tg.ready();
   tg.expand();
@@ -23,11 +29,15 @@ const btnStart = $("btn-start");
 const btnStop = $("btn-stop");
 const photoInput = $("photo-input");
 const resultsEl = $("results");
+const sendHint = $("send-hint");
 
 const diag = {
   Umgebung: inTelegram ? "Telegram Mini App" : "Browser (nicht in Telegram)",
   "Telegram-Plattform": tg?.platform ?? "–",
   "Telegram-Version": tg?.version ?? "–",
+  "Senden an Chat": canSendToChat
+    ? "möglich (Tastatur-Knopf)"
+    : inTelegram ? "nicht möglich (über Menü-Knopf geöffnet)" : "nicht möglich (nicht in Telegram)",
   "Kamera-API (getUserMedia)": navigator.mediaDevices?.getUserMedia ? "vorhanden" : "fehlt",
   "Nativer BarcodeDetector": "BarcodeDetector" in window ? "vorhanden" : "fehlt",
   Erkennung: "wird geladen …",
@@ -42,6 +52,7 @@ let stream = null;
 let scanning = false;
 let scanStartedAt = 0;
 let lastHit = { code: null, at: 0 };
+let nextResultId = 1;
 
 // ---------- Diagnose ----------
 
@@ -106,8 +117,13 @@ function handleCode(code, format, way, elapsedMs) {
   if (code === lastHit.code && now - lastHit.at < DUPLICATE_WINDOW_MS) return;
   lastHit = { code, at: now };
 
+  if (results.length >= MAX_CODES) {
+    setStatus(`Höchstens ${MAX_CODES} Codes pro Sendung. Bitte erst senden.`, "warn");
+    return;
+  }
+
   const valid = checkDigitValid(code, format);
-  results.unshift({ code, format, way, elapsedMs, valid, at: new Date() });
+  results.unshift({ id: nextResultId++, code, format, way, elapsedMs, valid, at: new Date() });
   renderResults();
   log(`Erkannt (${way}): ${code} [${format}] nach ${(elapsedMs / 1000).toFixed(1)} s`);
 
@@ -116,10 +132,25 @@ function handleCode(code, format, way, elapsedMs) {
   setTimeout(() => viewport.classList.remove("hit"), 400);
 }
 
+function removeResult(id) {
+  const index = results.findIndex((r) => r.id === id);
+  if (index >= 0) results.splice(index, 1);
+  renderResults();
+}
+
 function renderResults() {
   resultsEl.replaceChildren();
+  if (!results.length) {
+    const li = document.createElement("li");
+    li.className = "hint";
+    li.textContent = "Noch nichts erkannt.";
+    resultsEl.append(li);
+  }
   for (const r of results) {
     const li = document.createElement("li");
+    li.className = "result";
+
+    const body = document.createElement("div");
     const code = document.createElement("div");
     code.className = "code";
     code.textContent = r.code;
@@ -136,9 +167,65 @@ function renderResults() {
         `${r.at.toLocaleTimeString("de-DE")} · `,
       check,
     );
-    li.append(code, meta);
+    body.append(code, meta);
+
+    const remove = document.createElement("button");
+    remove.className = "remove";
+    remove.type = "button";
+    remove.textContent = "✕";
+    remove.title = "Entfernen";
+    remove.addEventListener("click", () => removeResult(r.id));
+
+    li.append(body, remove);
     resultsEl.append(li);
   }
+  updateSendControls();
+}
+
+// ---------- An den Chat senden ----------
+
+function buildPayload() {
+  return {
+    v: PAYLOAD_VERSION,
+    typ: "barcode-scan",
+    codes: [...results].reverse().map((r) => ({
+      code: r.code,
+      format: r.format,
+      weg: r.way === "Live-Scan" ? "live" : "foto",
+      at: r.at.toISOString(),
+    })),
+  };
+}
+
+function updateSendControls() {
+  const n = results.length;
+  if (!inTelegram) {
+    sendHint.textContent = "Senden geht nur innerhalb von Telegram.";
+    return;
+  }
+  if (!canSendToChat) {
+    sendHint.textContent =
+      "Diese App wurde über den Menü-Knopf geöffnet. Zum Senden bitte im Chat /start schicken " +
+      "und die App über den Knopf „📷 Scannen“ über der Tastatur öffnen.";
+    return;
+  }
+  sendHint.textContent = n
+    ? `${n} Code(s) bereit. Unten auf „An Chat senden“ tippen.`
+    : "Codes scannen, dann gesammelt an den Chat senden.";
+  if (n) {
+    tg.MainButton.setText(`${n} Code${n === 1 ? "" : "s"} an Chat senden`);
+    tg.MainButton.show();
+  } else {
+    tg.MainButton.hide();
+  }
+}
+
+function sendToChat() {
+  if (!canSendToChat || !results.length) return;
+  const data = JSON.stringify(buildPayload());
+  log(`Sende ${results.length} Code(s) an den Bot (${data.length} Byte).`);
+  stopLive();
+  tg.sendData(data); // schließt die Mini App
 }
 
 // ---------- Weg 1: Live-Scan ----------
@@ -227,6 +314,7 @@ async function startLive() {
 }
 
 function stopLive() {
+  if (!scanning && !stream) return;
   scanning = false;
   stream?.getTracks().forEach((t) => t.stop());
   stream = null;
@@ -311,9 +399,11 @@ document.addEventListener("visibilitychange", () => {
     stopLive();
   }
 });
+if (canSendToChat) tg.MainButton.onClick(sendToChat);
 
 renderDiag();
-log(`Gestartet in: ${diag.Umgebung}`);
+renderResults();
+log(`Gestartet in: ${diag.Umgebung} · Senden an Chat: ${diag["Senden an Chat"]}`);
 
 loadDetector()
   .then((engine) => {
