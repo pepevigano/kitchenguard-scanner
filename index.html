@@ -85,7 +85,7 @@
 </head>
 <body>
   <h1>EAN-Scanner</h1>
-  <p class="hint">KitchenGuard · Machbarkeitstest für Telegram Mini Apps</p>
+  <p class="hint">KitchenGuard · Machbarkeitstest für Telegram Mini Apps · <span id="version">Version ? (app.js nicht geladen)</span></p>
   <div id="status" class="hint">Erkennung wird geladen …</div>
 
   <section>
@@ -126,6 +126,10 @@
     <textarea id="report-fallback" hidden readonly></textarea>
   </section>
 
-  <script type="module" src="app.js"></script>
+  <!-- app.js mit derselben ?v=-Nummer wie die Seite laden, damit Telegram keine alte Version aus dem Zwischenspeicher nimmt. -->
+  <script type="module">
+    const v = new URLSearchParams(location.search).get("v") ?? Date.now();
+    import(`./app.js?v=${encodeURIComponent(v)}`);
+  </script>
 </body>
 </html>

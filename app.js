@@ -3,6 +3,10 @@
 // (Telegram.WebApp.sendData – nur möglich, wenn die App über den Tastatur-Knopf
 // des Bots geöffnet wurde).
 
+// Bei jeder Änderung erhöhen und SCANNER_URL in der .env des Bots auf dieselbe ?v=-Nummer setzen.
+const APP_VERSION = 4;
+const URL_VERSION = new URLSearchParams(location.search).get("v");
+
 const ZXING_PONYFILL_URL =
   "https://cdn.jsdelivr.net/npm/barcode-detector@3.2.2/dist/es/ponyfill.min.js";
 const FORMATS = ["ean_13", "ean_8", "upc_a", "upc_e"];
@@ -32,7 +36,17 @@ const photoInput = $("photo-input");
 const resultsEl = $("results");
 const sendHint = $("send-hint");
 
+function renderVersion() {
+  const el = $("version");
+  const matches = URL_VERSION === null || URL_VERSION === String(APP_VERSION);
+  el.textContent = matches
+    ? `Version ${APP_VERSION}`
+    : `Version ${APP_VERSION} ⚠️ Adresse verlangt v${URL_VERSION}`;
+  el.className = matches ? "" : "warn";
+}
+
 const diag = {
+  "App-Version": `${APP_VERSION} (Adresse: ${URL_VERSION ? `?v=${URL_VERSION}` : "ohne ?v="})`,
   Umgebung: inTelegram ? "Telegram Mini App" : "Browser (nicht in Telegram)",
   "Telegram-Plattform": tg?.platform ?? "–",
   "Telegram-Version": tg?.version ?? "–",
@@ -430,6 +444,7 @@ document.addEventListener("visibilitychange", () => {
 });
 if (canSendToChat) tg.MainButton.onClick(sendToChat);
 
+renderVersion();
 renderDiag();
 renderResults();
 log(`Gestartet in: ${diag.Umgebung} · Senden an Chat: ${diag["Senden an Chat"]}`);

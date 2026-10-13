@@ -46,6 +46,8 @@ Eine Mini App muss über **HTTPS** erreichbar sein. Lokal per `file://` öffnen 
 
 > Die Menüpunkte bei BotFather können je nach Version leicht anders heißen. Gesucht ist der Punkt, an dem man den Menü-Knopf mit einer Web-Adresse verbindet.
 
+**Versionsanzeige:** Im Kopf der App steht die Version des geladenen Codes (`APP_VERSION` in `app.js`). Verlangt die Adresse eine andere `?v=`-Nummer, erscheint eine ⚠️-Warnung, dann wurde eine alte Version aus dem Zwischenspeicher geladen. Bei jeder Änderung `APP_VERSION` erhöhen und die Adresse im Bot (`SCANNER_URL` in der `.env`) auf dieselbe Nummer setzen. `app.js` wird automatisch mit derselben `?v=`-Nummer geladen.
+
 **Nach Änderungen an der Seite** speichert Telegram manchmal die alte Version zwischen. Dann die App schließen und neu öffnen, oder an die Adresse in BotFather `?v=2` anhängen.
 
 ## Testplan
