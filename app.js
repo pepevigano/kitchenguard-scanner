@@ -4,7 +4,7 @@
 // des Bots geöffnet wurde).
 
 // Bei jeder Änderung erhöhen und SCANNER_URL in der .env des Bots auf dieselbe ?v=-Nummer setzen.
-const APP_VERSION = 4;
+const APP_VERSION = 5;
 const URL_VERSION = new URLSearchParams(location.search).get("v");
 
 const ZXING_PONYFILL_URL =
@@ -16,6 +16,16 @@ const DUPLICATE_WINDOW_MS = 2500;
 const BLACK_FRAME_CHECK_MS = 2500;
 const MAX_CODES = 25; // sendData erlaubt höchstens 4096 Byte
 const PAYLOAD_VERSION = 1;
+
+// MHD-Test (Wegwerf-Test zu konzept/04_eingabemethoden.md): Texterkennung im Browser, nichts davon geht an den Chat.
+const OCR_SCRIPT_URL = "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js";
+const OCR_LANG_PATH = "https://tessdata.projectnaptha.com/4.0.0_fast";
+const OCR_INTERVAL_MS = 300; // Pause zwischen zwei Durchläufen, die Erkennung selbst dauert länger
+const MHD_STABLE_FRAMES = 2; // live: dasselbe Datum in so vielen Bildern nacheinander, bevor es übernommen wird
+const GUIDE = {
+  barcode: { left: 0.1, right: 0.1, top: 0.35, bottom: 0.35 },
+  mhd: { left: 0.05, right: 0.05, top: 0.22, bottom: 0.22 },
+};
 
 const tg = window.Telegram?.WebApp;
 const inTelegram = Boolean(tg && tg.platform && tg.platform !== "unknown");
@@ -35,6 +45,10 @@ const btnStop = $("btn-stop");
 const photoInput = $("photo-input");
 const resultsEl = $("results");
 const sendHint = $("send-hint");
+const guideEl = $("guide");
+const ocrTextEl = $("ocr-text");
+const mhdResultsEl = $("mhd-results");
+const mhdPhotoInput = $("mhd-photo-input");
 
 function renderVersion() {
   const el = $("version");
@@ -56,6 +70,8 @@ const diag = {
   "Kamera-API (getUserMedia)": navigator.mediaDevices?.getUserMedia ? "vorhanden" : "fehlt",
   "Nativer BarcodeDetector": "BarcodeDetector" in window ? "vorhanden" : "fehlt",
   Erkennung: "wird geladen …",
+  Texterkennung: "nicht geladen (erst beim MHD-Test)",
+  "OCR-Durchläufe": "0",
   Kamerabild: "–",
   "Analysierte Bilder": "0",
   "Letzter Erkennungsfehler": "–",
@@ -70,6 +86,16 @@ let scanning = false;
 let scanStartedAt = 0;
 let lastHit = { code: null, at: 0 };
 let nextResultId = 1;
+
+let mode = "barcode"; // "barcode" oder "mhd"
+let mhdLib = null; // Modul mhd.js, wird erst beim ersten MHD-Test geladen
+let ocrWorker = null;
+let ocrLoading = null;
+let ocrRuns = 0;
+let ocrLastMs = null;
+const mhdResults = [];
+const mhdSeen = new Map(); // live: Datum und Art -> Anzahl Bilder nacheinander
+let nextMhdId = 1;
 
 // ---------- Diagnose ----------
 
@@ -299,21 +325,25 @@ function grabFrame() {
 async function scanLoop() {
   if (!scanning) return;
   if (video.readyState >= 2 && video.videoWidth) {
-    try {
-      const codes = await detector.detect(grabFrame());
-      framesAnalysed++;
-      for (const c of codes) handleCode(c.rawValue, c.format, "Live-Scan", Date.now() - scanStartedAt);
-    } catch (err) {
-      if (err.message !== lastDetectError) log(`Fehler bei der Erkennung: ${err.name} – ${err.message}`);
-      lastDetectError = err.message;
-      diag["Letzter Erkennungsfehler"] = err.message;
-    }
-    if (framesAnalysed % 20 === 0) {
-      diag["Analysierte Bilder"] = `${framesAnalysed} (${frameCanvas.width}×${frameCanvas.height})`;
-      renderDiag();
+    if (mode === "mhd") {
+      await mhdStep();
+    } else {
+      try {
+        const codes = await detector.detect(grabFrame());
+        framesAnalysed++;
+        for (const c of codes) handleCode(c.rawValue, c.format, "Live-Scan", Date.now() - scanStartedAt);
+      } catch (err) {
+        if (err.message !== lastDetectError) log(`Fehler bei der Erkennung: ${err.name} – ${err.message}`);
+        lastDetectError = err.message;
+        diag["Letzter Erkennungsfehler"] = err.message;
+      }
+      if (framesAnalysed % 20 === 0) {
+        diag["Analysierte Bilder"] = `${framesAnalysed} (${frameCanvas.width}×${frameCanvas.height})`;
+        renderDiag();
+      }
     }
   }
-  setTimeout(scanLoop, SCAN_INTERVAL_MS);
+  setTimeout(scanLoop, mode === "mhd" ? OCR_INTERVAL_MS : SCAN_INTERVAL_MS);
 }
 
 async function startLive() {
@@ -347,7 +377,10 @@ async function startLive() {
   $("idle").hidden = true;
   $("guide").hidden = false;
   btnStop.disabled = false;
-  setStatus("Live-Scan läuft. Barcode in den Rahmen halten.", "hint");
+  setStatus(
+    mode === "mhd" ? "Texterkennung läuft. Aufdruck mit dem Datum in den Rahmen halten." : "Live-Scan läuft. Barcode in den Rahmen halten.",
+    "hint",
+  );
 
   scanning = true;
   scanStartedAt = Date.now();
@@ -395,6 +428,283 @@ async function scanPhoto(file) {
   }
 }
 
+// ---------- MHD-Test: Texterkennung ----------
+
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const el = document.createElement("script");
+    el.src = src;
+    el.onload = resolve;
+    el.onerror = () => reject(new Error(`Skript konnte nicht geladen werden: ${src}`));
+    document.head.append(el);
+  });
+}
+
+// Lädt Datums-Logik und Texterkennung erst beim ersten Gebrauch (mehrere MB, danach im Zwischenspeicher).
+function ensureOcr() {
+  if (ocrWorker) return Promise.resolve(ocrWorker);
+  ocrLoading ??= (async () => {
+    diag.Texterkennung = "wird geladen …";
+    renderDiag();
+    mhdLib = await import(`./mhd.js?v=${encodeURIComponent(URL_VERSION ?? APP_VERSION)}`);
+    await loadScript(OCR_SCRIPT_URL);
+    const worker = await window.Tesseract.createWorker("deu", 1, { langPath: OCR_LANG_PATH });
+    await worker.setParameters({ tessedit_pageseg_mode: "11" }); // verstreuter Text, ohne feste Spalten
+    ocrWorker = worker;
+    diag.Texterkennung = "Tesseract.js 5.1.1 (WebAssembly), Sprache deu";
+    log("Texterkennung geladen.");
+    renderDiag();
+    return worker;
+  })().catch((err) => {
+    ocrLoading = null;
+    diag.Texterkennung = `Fehler: ${err.message}`;
+    log(`Texterkennung konnte nicht geladen werden: ${err.message}`);
+    renderDiag();
+    throw err;
+  });
+  return ocrLoading;
+}
+
+const ocrCanvas = document.createElement("canvas");
+const ocrCtx = ocrCanvas.getContext("2d", { willReadFrequently: true });
+
+// Sichtbarer Ausschnitt des Videos (object-fit: cover) und darin der Rahmen, in Bildpunkten des Videos.
+function guideRectInVideo() {
+  const g = GUIDE[mode];
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  const boxW = viewport.clientWidth;
+  const boxH = viewport.clientHeight;
+  const scale = Math.max(boxW / vw, boxH / vh);
+  const visW = boxW / scale;
+  const visH = boxH / scale;
+  const offX = (vw - visW) / 2;
+  const offY = (vh - visH) / 2;
+  return {
+    x: offX + visW * g.left,
+    y: offY + visH * g.top,
+    w: visW * (1 - g.left - g.right),
+    h: visH * (1 - g.top - g.bottom),
+  };
+}
+
+// Ausschnitt in Graustufen mit gestrecktem Kontrast: Aufdrucke haben oft wenig Kontrast.
+function prepareForOcr(source, sx, sy, sw, sh) {
+  const scale = Math.max(0.25, Math.min(2, 1200 / sw));
+  ocrCanvas.width = Math.max(1, Math.round(sw * scale));
+  ocrCanvas.height = Math.max(1, Math.round(sh * scale));
+  ocrCtx.drawImage(source, sx, sy, sw, sh, 0, 0, ocrCanvas.width, ocrCanvas.height);
+  const image = ocrCtx.getImageData(0, 0, ocrCanvas.width, ocrCanvas.height);
+  const d = image.data;
+  let min = 255;
+  let max = 0;
+  for (let i = 0; i < d.length; i += 4) {
+    const gray = (d[i] * 299 + d[i + 1] * 587 + d[i + 2] * 114) / 1000;
+    d[i] = d[i + 1] = d[i + 2] = gray;
+    if (gray < min) min = gray;
+    if (gray > max) max = gray;
+  }
+  const range = Math.max(1, max - min);
+  for (let i = 0; i < d.length; i += 4) {
+    d[i] = d[i + 1] = d[i + 2] = ((d[i] - min) * 255) / range;
+  }
+  ocrCtx.putImageData(image, 0, 0);
+  return ocrCanvas;
+}
+
+async function ocrRead(source, sx, sy, sw, sh) {
+  const worker = await ensureOcr();
+  const canvas = prepareForOcr(source, sx, sy, sw, sh);
+  const started = performance.now();
+  const { data } = await worker.recognize(canvas);
+  ocrRuns++;
+  ocrLastMs = performance.now() - started;
+  diag["OCR-Durchläufe"] = `${ocrRuns} (zuletzt ${(ocrLastMs / 1000).toFixed(1)} s)`;
+  return data.text ?? "";
+}
+
+const KIND_LABELS = { mhd: "MHD", verbrauch: "Verbrauchsdatum", unbekannt: "Art unklar" };
+
+function addMhdResult(c, rawText, way, elapsedMs) {
+  mhdResults.unshift({
+    id: nextMhdId++,
+    c,
+    text: rawText,
+    way,
+    elapsedMs,
+    rating: null, // null = nicht bewertet, true = stimmt, false = falsch
+    at: new Date(),
+  });
+  log(`MHD gelesen (${way}): ${mhdLib.formatMhd(c)} [${KIND_LABELS[c.kind]}] nach ${(elapsedMs / 1000).toFixed(1)} s`);
+  tg?.HapticFeedback?.notificationOccurred(c.plausible ? "success" : "warning");
+  viewport.classList.add("hit");
+  setTimeout(() => viewport.classList.remove("hit"), 400);
+  renderMhdResults();
+}
+
+// Wertet den erkannten Text aus. Live wird ein Datum erst übernommen, wenn es in mehreren Bildern nacheinander gelesen wurde.
+// Gibt die Zahl der neu übernommenen Daten zurück.
+function handleMhdText(text, way, elapsedMs, immediate) {
+  const clean = text.replace(/\s+/g, " ").trim();
+  ocrTextEl.textContent = clean || "(nichts gelesen)";
+  const { candidates } = mhdLib.parseMhd(text);
+
+  const keys = new Set(candidates.map((c) => `${c.iso}|${c.kind}`));
+  for (const key of [...mhdSeen.keys()]) if (!keys.has(key)) mhdSeen.delete(key);
+
+  let added = 0;
+  for (const c of candidates) {
+    const key = `${c.iso}|${c.kind}`;
+    const count = (mhdSeen.get(key) ?? 0) + 1;
+    mhdSeen.set(key, count);
+    const alreadyListed = mhdResults.some((r) => `${r.c.iso}|${r.c.kind}` === key && Date.now() - r.at.getTime() < 8000);
+    if ((immediate || count >= MHD_STABLE_FRAMES) && !alreadyListed) {
+      addMhdResult(c, clean, way, elapsedMs);
+      added++;
+    }
+  }
+  return added;
+}
+
+async function mhdStep() {
+  try {
+    setStatus("Lese Text …", "hint");
+    const r = guideRectInVideo();
+    const text = await ocrRead(video, r.x, r.y, r.w, r.h);
+    if (!scanning || mode !== "mhd") return;
+    const added = handleMhdText(text, "Live", Date.now() - scanStartedAt, false);
+    setStatus(added ? "Datum erkannt." : "Texterkennung läuft. Aufdruck mit dem Datum in den Rahmen halten.", added ? "ok" : "hint");
+    if (ocrRuns % 3 === 0) renderDiag();
+  } catch (err) {
+    log(`Fehler bei der Texterkennung: ${err.name} – ${err.message}`);
+    diag["Letzter Erkennungsfehler"] = err.message;
+    setStatus(`Texterkennung nicht nutzbar: ${err.message}`, "bad");
+    setMode("barcode");
+    renderDiag();
+  }
+}
+
+async function scanMhdPhoto(file) {
+  const startedAt = Date.now();
+  setStatus("Foto wird gelesen. Beim ersten Mal wird die Texterkennung geladen (einige MB) …", "hint");
+  log(`MHD-Foto erhalten: ${file.type || "Typ unbekannt"}, ${(file.size / 1024).toFixed(0)} KB`);
+  try {
+    const bitmap = await createImageBitmap(file);
+    log(`MHD-Fotogröße: ${bitmap.width}×${bitmap.height}`);
+    const text = await ocrRead(bitmap, 0, 0, bitmap.width, bitmap.height);
+    bitmap.close?.();
+    const added = handleMhdText(text, "Foto", Date.now() - startedAt, true);
+    if (added) {
+      setStatus(`${added} Datum/Daten im Foto erkannt. Bitte prüfen und bewerten.`, "ok");
+    } else {
+      setStatus("Kein Datum im Foto gefunden. Der gelesene Text steht unter der Kamera.", "warn");
+      log("MHD-Foto: kein Datum gefunden.");
+      tg?.HapticFeedback?.notificationOccurred("error");
+    }
+    renderDiag();
+  } catch (err) {
+    setStatus(`Foto konnte nicht gelesen werden: ${err.message}`, "bad");
+    log(`Fehler beim MHD-Foto: ${err.name} – ${err.message}`);
+  }
+}
+
+function rateMhd(id, rating) {
+  const r = mhdResults.find((x) => x.id === id);
+  if (!r) return;
+  r.rating = r.rating === rating ? null : rating;
+  log(`MHD ${mhdLib.formatMhd(r.c)} bewertet: ${r.rating === null ? "nicht bewertet" : r.rating ? "stimmt" : "falsch"}`);
+  renderMhdResults();
+}
+
+function removeMhd(id) {
+  const index = mhdResults.findIndex((x) => x.id === id);
+  if (index >= 0) mhdResults.splice(index, 1);
+  renderMhdResults();
+}
+
+function renderMhdResults() {
+  mhdResultsEl.replaceChildren();
+  if (!mhdResults.length) {
+    const li = document.createElement("li");
+    li.className = "hint";
+    li.textContent = "Noch kein Datum gelesen.";
+    mhdResultsEl.append(li);
+    return;
+  }
+  for (const r of mhdResults) {
+    const li = document.createElement("li");
+    li.className = "result mhd";
+
+    const body = document.createElement("div");
+    const date = document.createElement("div");
+    date.className = "code";
+    date.textContent = mhdLib.formatMhd(r.c);
+
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const flags = [KIND_LABELS[r.c.kind], r.c.precision === "tag" ? "Tag genau" : "nur Monat"];
+    if (r.c.ende) flags.push("„Ende“");
+    flags.push(r.c.plausible ? "plausibel" : "unplausibel");
+    meta.append(`${flags.join(" · ")} · ${r.way} · ${(r.elapsedMs / 1000).toFixed(1)} s`);
+
+    const raw = document.createElement("div");
+    raw.className = "meta raw";
+    raw.textContent = `Gelesen: „${r.c.raw}“`;
+    body.append(date, meta, raw);
+
+    const marks = document.createElement("div");
+    marks.className = "marks";
+    for (const [value, label, cls] of [[true, "✔ stimmt", "ok"], [false, "✘ falsch", "bad"]]) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = `mark ${cls}${r.rating === value ? " on" : ""}`;
+      b.textContent = label;
+      b.setAttribute("aria-pressed", String(r.rating === value));
+      b.addEventListener("click", () => rateMhd(r.id, value));
+      marks.append(b);
+    }
+    const remove = document.createElement("button");
+    remove.className = "remove";
+    remove.type = "button";
+    remove.textContent = "✕";
+    remove.title = "Entfernen";
+    remove.addEventListener("click", () => removeMhd(r.id));
+    marks.append(remove);
+
+    li.append(body, marks);
+    mhdResultsEl.append(li);
+  }
+}
+
+function setMode(next) {
+  mode = next;
+  for (const radio of document.querySelectorAll('input[name="mode"]')) radio.checked = radio.value === next;
+  const g = GUIDE[next];
+  guideEl.style.left = `${g.left * 100}%`;
+  guideEl.style.right = `${g.right * 100}%`;
+  guideEl.style.top = `${g.top * 100}%`;
+  guideEl.style.bottom = `${g.bottom * 100}%`;
+  mhdSeen.clear();
+  ocrTextEl.hidden = next !== "mhd";
+  if (next === "mhd") {
+    ocrTextEl.textContent = "Texterkennung wird geladen (einige MB, nur beim ersten Mal) …";
+    ensureOcr()
+      .then(() => {
+        if (mode === "mhd") ocrTextEl.textContent = "(noch nichts gelesen)";
+      })
+      .catch((err) => {
+        setStatus(`Texterkennung konnte nicht geladen werden: ${err.message}`, "bad");
+        setMode("barcode");
+      });
+  }
+  if (scanning) {
+    setStatus(
+      next === "mhd" ? "Texterkennung läuft. Aufdruck mit dem Datum in den Rahmen halten." : "Live-Scan läuft. Barcode in den Rahmen halten.",
+      "hint",
+    );
+  }
+}
+
 // ---------- Testprotokoll ----------
 
 function buildReport() {
@@ -405,6 +715,20 @@ function buildReport() {
   for (const r of [...results].reverse()) {
     const check = r.valid === true ? "ok" : r.valid === false ? "FALSCH" : "nicht geprüft";
     lines.push(`  ${r.code} [${r.format}] ${r.way}, ${(r.elapsedMs / 1000).toFixed(1)} s, Prüfziffer ${check}`);
+  }
+  lines.push("", "MHD-Test (Texterkennung):");
+  if (!mhdResults.length) lines.push("  (keine)");
+  for (const r of [...mhdResults].reverse()) {
+    const rating = r.rating === null ? "nicht bewertet" : r.rating ? "stimmt" : "FALSCH";
+    lines.push(
+      `  ${mhdLib.formatMhd(r.c)} [${KIND_LABELS[r.c.kind]}, ${r.c.precision}] ${r.way}, ${(r.elapsedMs / 1000).toFixed(1)} s, ` +
+        `gelesen „${r.c.raw}“, ${rating}`,
+    );
+  }
+  if (mhdResults.length) {
+    const right = mhdResults.filter((r) => r.rating === true).length;
+    const wrong = mhdResults.filter((r) => r.rating === false).length;
+    lines.push(`  Summe: ${right} stimmt, ${wrong} falsch, ${mhdResults.length - right - wrong} nicht bewertet`);
   }
   lines.push("", "Log:", ...logLines.map((l) => `  ${l}`));
   return lines.join("\n");
@@ -436,6 +760,14 @@ photoInput.addEventListener("change", () => {
   photoInput.value = "";
   if (file && detector) scanPhoto(file);
 });
+for (const radio of document.querySelectorAll('input[name="mode"]')) {
+  radio.addEventListener("change", () => radio.checked && setMode(radio.value));
+}
+mhdPhotoInput.addEventListener("change", () => {
+  const file = mhdPhotoInput.files?.[0];
+  mhdPhotoInput.value = "";
+  if (file) scanMhdPhoto(file);
+});
 document.addEventListener("visibilitychange", () => {
   if (document.hidden && scanning) {
     log("App im Hintergrund – Kamera gestoppt.");
@@ -447,6 +779,7 @@ if (canSendToChat) tg.MainButton.onClick(sendToChat);
 renderVersion();
 renderDiag();
 renderResults();
+renderMhdResults();
 log(`Gestartet in: ${diag.Umgebung} · Senden an Chat: ${diag["Senden an Chat"]}`);
 
 loadDetector()
